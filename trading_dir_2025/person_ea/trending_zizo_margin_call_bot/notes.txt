@@ -1,0 +1,7 @@
+TIMEFRAME: 1 MIN
+
+USES 3EMA
+   - takes trades on retest of 200 EMA
+   - takes bots on FGV retest
+
+Has HUD (display)
