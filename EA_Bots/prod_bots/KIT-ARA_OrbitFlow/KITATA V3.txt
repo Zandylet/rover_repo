@@ -1,0 +1,241 @@
+//+------------------------------------------------------------------+
+//| KIT-ARA.mq5 – GARUDA THEME (TRANSPARENT HUD)                     |
+//| Logic: Added Multi-Bar EMA Confirmation (Capital Preservation)   |
+//+------------------------------------------------------------------+
+#property strict
+#property version "2.9"
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//--- Inputs
+input double RiskPercent      = 0.5;
+input int    ATRPeriod        = 14;
+input double ATR_SL_Mult      = 2.0;
+input int    MaxTrades        = 3;
+input int    CooldownBars     = 3;
+input int    EMA_Confirm_Bars = 3; // Bars required to hold cross before entry
+
+input int FastEMA = 9, SlowEMA = 21, IntraEMA = 55, TrendEMA = 200;
+input int ADXPeriod = 14, MinADX = 22, MomPeriod = 14;
+
+//--- Indicator handles
+int hFast, hSlow, hIntra, hTrend, hADX, hMom, hATR, hHTF, hD1;
+
+//--- Globals
+int cooldown = 0;
+string tradeReason = "Idle";
+
+//--- HUD settings: Garuda Dr460nized Transparent
+#define HUD_PREFIX "KIT_ARA_LINE_"
+int hudX = 20;
+int hudY = 20;
+int hudLineHeight = 16;
+int hudFontSize = 10;
+color hudColor = C'255,0,127'; // Neon Pink
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   hFast  = iMA(_Symbol, PERIOD_M15, FastEMA, 0, MODE_EMA, PRICE_CLOSE);
+   hSlow  = iMA(_Symbol, PERIOD_M15, SlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+   hIntra = iMA(_Symbol, PERIOD_M15, IntraEMA, 0, MODE_EMA, PRICE_CLOSE);
+   hTrend = iMA(_Symbol, PERIOD_M15, TrendEMA, 0, MODE_EMA, PRICE_CLOSE);
+   hHTF   = iMA(_Symbol, PERIOD_H1, 55, 0, MODE_EMA, PRICE_CLOSE);
+   hD1    = iMA(_Symbol, PERIOD_D1, 21, 0, MODE_EMA, PRICE_CLOSE);
+   hADX   = iADX(_Symbol, PERIOD_M15, ADXPeriod);
+   hMom   = iMomentum(_Symbol, PERIOD_M15, MomPeriod, PRICE_CLOSE);
+   hATR   = iATR(_Symbol, PERIOD_M15, ATRPeriod);
+
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   ObjectsDeleteAll(0, HUD_PREFIX);
+}
+
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Cooldown check
+   if(cooldown > 0)
+   {
+      cooldown--;
+      tradeReason = "Cooldown active";
+      UpdateHUD(false,false,false,false,false,false,false,0,0,"Waiting...");
+      return;
+   }
+
+   //--- Copy indicator buffers (increased depth for confirmation)
+   double f[], s[], i[], t[], adx[], mom[], atr[], htf[], d1[];
+   ArraySetAsSeries(f,true);   ArraySetAsSeries(s,true);
+   ArraySetAsSeries(i,true);   ArraySetAsSeries(t,true);
+   ArraySetAsSeries(adx,true); ArraySetAsSeries(mom,true);
+   ArraySetAsSeries(atr,true); ArraySetAsSeries(htf,true);
+   ArraySetAsSeries(d1,true);
+
+   if(CopyBuffer(hFast,0,0,5,f)<5) return;
+   if(CopyBuffer(hSlow,0,0,5,s)<5) return;
+   if(CopyBuffer(hIntra,0,0,1,i)<1) return;
+   if(CopyBuffer(hTrend,0,0,1,t)<1) return;
+   if(CopyBuffer(hADX,0,0,1,adx)<1) return;
+   if(CopyBuffer(hMom,0,0,2,mom)<2) return;
+   if(CopyBuffer(hATR,0,0,1,atr)<1) return;
+   if(CopyBuffer(hHTF,0,0,1,htf)<1) return;
+   if(CopyBuffer(hD1,0,0,1,d1)<1) return;
+
+   //--- Trend & momentum
+   bool trendPass = adx[0] >= MinADX;
+   bool momBuy  = mom[0] > 100 && mom[0] > mom[1];
+   bool momSell = mom[0] < 100 && mom[0] < mom[1];
+   double gapATR = MathAbs(i[0] - t[0]) / atr[0];
+   bool gapPass = gapATR >= 1.2;
+
+   bool bullishTrend = i[0] > t[0] && trendPass && gapPass;
+   bool bearishTrend = i[0] < t[0] && trendPass && gapPass;
+   bool htfBuy  = SymbolInfoDouble(_Symbol, SYMBOL_BID) > htf[0];
+
+   //--- 1. Candle Close Logic
+   static datetime lastBarTime = 0;
+   datetime curBarTime = iTime(_Symbol, PERIOD_M15, 0);
+   if(curBarTime == lastBarTime)
+   {
+      tradeReason = "Syncing signals...";
+      UpdateHUD(bullishTrend,bearishTrend,momBuy,momSell,trendPass,gapPass,htfBuy,adx[0],atr[0],tradeReason);
+      return;
+   }
+   lastBarTime = curBarTime;
+
+   //--- 2. EMA slope confirmation
+   double slopeFast = f[0] - f[1];
+   double slopeSlow = s[0] - s[1];
+   bool SlopeConfirmBuy  = slopeFast > 0 && slopeSlow > 0;
+   bool SlopeConfirmSell = slopeFast < 0 && slopeSlow < 0;
+
+   //--- 3. Confirmation Pause (Lookback check)
+   bool ConfirmedBuy = true;
+   bool ConfirmedSell = true;
+   for(int b=0; b < EMA_Confirm_Bars; b++)
+   {
+       if(f[b] <= s[b]) ConfirmedBuy = false;
+       if(f[b] >= s[b]) ConfirmedSell = false;
+   }
+
+   //--- 4. Max trades check
+   if(GetActiveCount() >= MaxTrades)
+   {
+      tradeReason = "Max trades reached";
+      UpdateHUD(bullishTrend,bearishTrend,momBuy,momSell,trendPass,gapPass,htfBuy,adx[0],atr[0],tradeReason);
+      return;
+   }
+
+   //--- 5. Final trade signals
+   bool buySignal  = ConfirmedBuy && SlopeConfirmBuy && bullishTrend && momBuy && htfBuy;
+   bool sellSignal = ConfirmedSell && SlopeConfirmSell && bearishTrend && momSell && !htfBuy;
+
+   if(buySignal)
+   {
+      tradeReason = "BUY (Confirmed)";
+      Execute(ORDER_TYPE_BUY, atr[0]);
+      cooldown = CooldownBars;
+   }
+   else if(sellSignal)
+   {
+      tradeReason = "SELL (Confirmed)";
+      Execute(ORDER_TYPE_SELL, atr[0]);
+      cooldown = CooldownBars;
+   }
+   else
+   {
+      tradeReason = "Scanning Waves...";
+   }
+
+   ManageBreakeven(atr[0]);
+   UpdateHUD(bullishTrend,bearishTrend,momBuy,momSell,trendPass,gapPass,htfBuy,adx[0],atr[0],tradeReason);
+}
+
+//+------------------------------------------------------------------+
+//| HUD & Utility Functions (Preserved per Instructions)             |
+//+------------------------------------------------------------------+
+void UpdateHUD(bool bullishTrend, bool bearishTrend, bool momBuy, bool momSell, bool trendPass, bool gapPass, bool htfBuy, double adx, double atr, string status)
+{
+   string trend = bullishTrend ? "BULLISH" : bearishTrend ? "BEARISH" : "STAGNANT";
+   string momentum = momBuy ? "LONG" : momSell ? "SHORT" : "NONE";
+   string htf = htfBuy ? "BULLISH" : "BEARISH";
+
+   string lines[];
+   ArrayResize(lines, 12);
+   lines[0]  = ">> KIT-ARA [DR460NIZED]";
+   lines[1]  = "============================";
+   lines[2]  = " NODE:    " + _Symbol;
+   lines[3]  = " TREND:   " + trend;
+   lines[4]  = " HTF:      " + htf;
+   lines[5]  = " MOM:      " + momentum;
+   lines[6]  = " ADX:      " + DoubleToString(adx,1) + " [" + IntegerToString(MinADX) + "]";
+   lines[7]  = " ATR:      " + DoubleToString(atr,_Digits);
+   lines[8]  = " GAP:      " + (gapPass ? "STABLE" : "WEAK");
+   lines[9]  = " TRADES:  " + IntegerToString(GetActiveCount()) + " / " + IntegerToString(MaxTrades);
+   lines[10] = " COOLDWN: " + IntegerToString(cooldown);
+   lines[11] = " STATUS:   " + status;
+
+   for(int i=0; i<ArraySize(lines); i++)
+   {
+      string name = HUD_PREFIX + IntegerToString(i);
+      if(ObjectFind(0, name) < 0)
+      {
+         ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+         ObjectSetInteger(0, name, OBJPROP_XDISTANCE, hudX);
+         ObjectSetInteger(0, name, OBJPROP_YDISTANCE, hudY + (i * hudLineHeight));
+         ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+         ObjectSetInteger(0, name, OBJPROP_FONTSIZE, hudFontSize);
+         ObjectSetString(0, name, OBJPROP_FONT, "Courier New");
+         ObjectSetInteger(0, name, OBJPROP_COLOR, hudColor);
+         ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      }
+      ObjectSetString(0, name, OBJPROP_TEXT, lines[i]);
+   }
+   ChartRedraw();
+}
+
+void Execute(ENUM_ORDER_TYPE type, double atr)
+{
+   double slDist = atr * ATR_SL_Mult;
+   double riskMoney = AccountInfoDouble(ACCOUNT_BALANCE) * (RiskPercent/100.0);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double lot = NormalizeDouble(riskMoney / ((slDist / tickSize) * tickValue), 2);
+   if(lot < 0.01) lot = 0.01;
+   double price = (type==ORDER_TYPE_BUY) ? SymbolInfoDouble(_Symbol,SYMBOL_ASK) : SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double sl = (type==ORDER_TYPE_BUY) ? price - slDist : price + slDist;
+   trade.PositionOpen(_Symbol, type, lot, price, sl, 0, "KIT-ARA");
+}
+
+void ManageBreakeven(double atr)
+{
+   for(int k=PositionsTotal()-1; k>=0; k--)
+   {
+      if(PositionGetSymbol(k) != _Symbol) continue;
+      ulong ticket = PositionGetTicket(k);
+      PositionSelectByTicket(ticket);
+      double open = PositionGetDouble(POSITION_PRICE_OPEN),
+             cur  = PositionGetDouble(POSITION_PRICE_CURRENT),
+             sl   = PositionGetDouble(POSITION_SL);
+      long type = PositionGetInteger(POSITION_TYPE);
+
+      if(type==POSITION_TYPE_BUY && cur-open > atr*2 && sl < open)
+          trade.PositionModify(ticket, open + atr*0.1, 0);
+
+      if(type==POSITION_TYPE_SELL && open-cur > atr*2 && (sl > open || sl==0))
+          trade.PositionModify(ticket, open - atr*0.1, 0);
+   }
+}
+
+int GetActiveCount()
+{
+   int c=0;
+   for(int i=0;i<PositionsTotal();i++)
+       if(PositionGetSymbol(i)==_Symbol) c++;
+   return c;
+}
