@@ -1,0 +1,129 @@
+//+------------------------------------------------------------------+
+//| KIT-ARA.mq5 – FIXED & STABILIZED                                  |
+//| Logic preserved – execution & risk corrected                      |
+//+------------------------------------------------------------------+
+#property strict
+#property version "2.1"
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//--- Inputs
+input double RiskPercent      = 0.5;
+input int    ATRPeriod        = 14;
+input double ATR_SL_Mult      = 2.0;
+input int    MaxTrades        = 3;
+input int    CooldownBars     = 3;
+
+input int FastEMA = 9, SlowEMA = 21, IntraEMA = 55, TrendEMA = 200;
+input int ADXPeriod = 14, MinADX = 22, MomPeriod = 14;
+
+//--- Handles
+int hFast, hSlow, hIntra, hTrend, hADX, hMom, hATR, hHTF, hD1;
+
+//--- Globals
+bool signalArmed = false;
+int armedType = -1;
+int cooldown = 0;
+bool rangeFilterActive = false;
+string tradeReason = "Idle";
+
+//+------------------------------------------------------------------+
+int OnInit() {
+   hFast  = iMA(_Symbol, PERIOD_M15, FastEMA, 0, MODE_EMA, PRICE_CLOSE);
+   hSlow  = iMA(_Symbol, PERIOD_M15, SlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+   hIntra = iMA(_Symbol, PERIOD_M15, IntraEMA, 0, MODE_EMA, PRICE_CLOSE);
+   hTrend = iMA(_Symbol, PERIOD_M15, TrendEMA, 0, MODE_EMA, PRICE_CLOSE);
+   hHTF   = iMA(_Symbol, PERIOD_H1, 55, 0, MODE_EMA, PRICE_CLOSE);
+   hD1    = iMA(_Symbol, PERIOD_D1, 21, 0, MODE_EMA, PRICE_CLOSE);
+   hADX   = iADX(_Symbol, PERIOD_M15, ADXPeriod);
+   hMom   = iMomentum(_Symbol, PERIOD_M15, MomPeriod, PRICE_CLOSE);
+   hATR   = iATR(_Symbol, PERIOD_M15, ATRPeriod);
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+void OnTick() {
+   if(cooldown > 0) { cooldown--; return; }
+
+   double f[], s[], i[], t[], adx[], mom[], atr[], htf[], d1[];
+   ArraySetAsSeries(f,true); ArraySetAsSeries(s,true);
+   ArraySetAsSeries(i,true); ArraySetAsSeries(t,true);
+   ArraySetAsSeries(adx,true); ArraySetAsSeries(mom,true);
+   ArraySetAsSeries(atr,true); ArraySetAsSeries(htf,true); ArraySetAsSeries(d1,true);
+
+   if(CopyBuffer(hFast,0,0,3,f)<3) return;
+   if(CopyBuffer(hSlow,0,0,3,s)<3) return;
+   if(CopyBuffer(hIntra,0,0,3,i)<3) return;
+   if(CopyBuffer(hTrend,0,0,3,t)<3) return;
+   if(CopyBuffer(hADX,0,0,1,adx)<1) return;
+   if(CopyBuffer(hMom,0,0,2,mom)<2) return;
+   if(CopyBuffer(hATR,0,0,1,atr)<1) return;
+   if(CopyBuffer(hHTF,0,0,1,htf)<1) return;
+   if(CopyBuffer(hD1,0,0,1,d1)<1) return;
+
+   bool trendPass = adx[0] >= MinADX;
+   bool momBuy = mom[0] > 100 && mom[0] > mom[1];
+   bool momSell = mom[0] < 100 && mom[0] < mom[1];
+
+   double gapATR = MathAbs(i[0] - t[0]) / atr[0];
+   bool gapPass = gapATR >= 1.2;
+
+   bool bullishTrend = i[0] > t[0] && trendPass && gapPass;
+   bool bearishTrend = i[0] < t[0] && trendPass && gapPass;
+
+   bool htfBuy = SymbolInfoDouble(_Symbol, SYMBOL_BID) > htf[0];
+   bool htfSell = !htfBuy;
+
+   bool buySignal  = f[0] > i[0] && s[0] > i[0] && bullishTrend && momBuy && htfBuy;
+   bool sellSignal = f[0] < i[0] && s[0] < i[0] && bearishTrend && momSell && htfSell;
+
+   if(GetActiveCount() >= MaxTrades) return;
+
+   if(buySignal)  Execute(ORDER_TYPE_BUY, atr[0]);
+   if(sellSignal) Execute(ORDER_TYPE_SELL, atr[0]);
+
+   ManageBreakeven(atr[0]);
+}
+
+//+------------------------------------------------------------------+
+void Execute(ENUM_ORDER_TYPE type, double atr) {
+   double slDist = atr * ATR_SL_Mult;
+   double riskMoney = AccountInfoDouble(ACCOUNT_BALANCE) * (RiskPercent/100.0);
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+
+   double lot = NormalizeDouble(riskMoney / ((slDist/tickSize)*tickValue), 2);
+   if(lot < 0.01) lot = 0.01;
+
+   double price = (type==ORDER_TYPE_BUY)?SymbolInfoDouble(_Symbol,SYMBOL_ASK):SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double sl = (type==ORDER_TYPE_BUY)?price-slDist:price+slDist;
+
+   trade.PositionOpen(_Symbol,type,lot,price,sl,0,"KIT-ARA");
+}
+
+//+------------------------------------------------------------------+
+void ManageBreakeven(double atr) {
+   for(int k=PositionsTotal()-1;k>=0;k--) {
+      if(PositionGetSymbol(k)!=_Symbol) continue;
+      ulong ticket=PositionGetTicket(k);
+      double open=PositionGetDouble(POSITION_PRICE_OPEN);
+      double cur=PositionGetDouble(POSITION_PRICE_CURRENT);
+      double sl=PositionGetDouble(POSITION_SL);
+      long type=PositionGetInteger(POSITION_TYPE);
+
+      if(type==POSITION_TYPE_BUY && cur-open > atr*2 && sl < open)
+         trade.PositionModify(ticket, open + atr*0.1, 0);
+
+      if(type==POSITION_TYPE_SELL && open-cur > atr*2 && (sl > open || sl==0))
+         trade.PositionModify(ticket, open - atr*0.1, 0);
+   }
+}
+
+//+------------------------------------------------------------------+
+int GetActiveCount() {
+   int c=0;
+   for(int i=0;i<PositionsTotal();i++)
+      if(PositionGetSymbol(i)==_Symbol) c++;
+   return c;
+}
