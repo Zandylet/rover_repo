@@ -1,0 +1,215 @@
+//+------------------------------------------------------------------+
+//|                                                      KIT-ARA.mq5 |
+//|   CHIPS AND FISH - FULL TRADING TERMINAL + VISUAL SIGNALS v3.06 |
+//+------------------------------------------------------------------+
+#property copyright "KIT-ARA"
+#property version   "3.06" 
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+
+CTrade trade;
+CPositionInfo posInfo;
+
+//--- TELEGRAM INPUTS
+input string    InpTelegramToken = "YOUR_BOT_TOKEN"; 
+input string    InpTelegramID    = "YOUR_CHAT_ID";    
+input bool      InpNotifications = true;             
+
+//--- EXISTING INPUTS
+input double RiskPercent        = 0.5;   
+input double ManualLotSize      = 0.01;   
+input double MaxSpread          = 3.0;   
+input int    ATRPeriod          = 14;
+input double ATR_SL_Mult        = 2.0;
+input int    MaxTrades          = 3;   
+input double RetestATRRange     = 0.5;   
+input double WeakTrendADX       = 25;   
+input double HighVolATRFactor   = 2.0;   
+
+//--- EXIT & SAFETY INPUTS
+input int    ExitHourFriday    = 21;
+input int    MinsBeforeNFP     = 60;    
+input int    MinsAfterNFP      = 30;    
+
+//--- NEW TREND FOLLOWING INPUT
+input bool   EnableTrendFollow = true; 
+
+//--- TREND-RIDING SL INPUTS
+input bool EnableTrendRide     = true;   
+input double TrendRideATR      = 1.5;  
+input int TrendRideEMA         = 55;  
+
+//--- INDICATORS
+input int FastEMA = 9, SlowEMA = 21, IntraEMA = 55, TrendEMA = 200;
+input int ADXPeriod = 14, MinADX = 22, MomPeriod = 14;
+
+//--- GLOBALS
+int hFast, hSlow, hIntra, hTrend, hADX, hMom, hATR, hHTF, hD1, hADX_HTF, hATR_M3;
+string tradeReason = "SYSTEM IDLE";
+string m3_status = "SCANNING...";
+bool BotActive = true; 
+bool ManualPause = false;
+bool PrevBotState = true; 
+double PauseThresholdADX = 20; 
+
+bool pullbackActive = false;
+string lastPullbackType = "";
+string lastSession = "";
+bool londonSweeped = false;
+double londonHigh = 0, londonLow = 0;
+string lastMarketState = "";
+datetime lastBreakoutTime = 0;
+datetime lastM3BreakoutTime = 0;
+datetime lastRetestNotify = 0;
+double initialEquity = 0;
+double equityTarget = 0;
+double equityStopLoss = 0; 
+
+#define HUD_X 20
+#define HUD_Y 30
+
+//+------------------------------------------------------------------+
+//| Helper to get Indicator Values                                   |
+//+------------------------------------------------------------------+
+double GetVal(int handle, int buffer=0, int index=0) {
+   double val[];
+   ArraySetAsSeries(val, true);
+   if(CopyBuffer(handle, buffer, index, 1, val) > 0) return val[0];
+   return 0;
+}
+
+int OnInit() {
+   hFast  = iMA(_Symbol, PERIOD_M15, FastEMA, 0, MODE_EMA, PRICE_CLOSE);
+   hSlow  = iMA(_Symbol, PERIOD_M15, SlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+   hIntra = iMA(_Symbol, PERIOD_M15, IntraEMA, 0, MODE_EMA, PRICE_CLOSE);
+   hTrend = iMA(_Symbol, PERIOD_M15, TrendEMA, 0, MODE_EMA, PRICE_CLOSE);
+   hHTF   = iMA(_Symbol, PERIOD_H1, 200, 0, MODE_EMA, PRICE_CLOSE); 
+   hD1    = iMA(_Symbol, PERIOD_D1, 200, 0, MODE_EMA, PRICE_CLOSE); 
+
+   hADX     = iADX(_Symbol, PERIOD_M15, ADXPeriod);
+   hADX_HTF = iADX(_Symbol, PERIOD_H1, ADXPeriod); 
+   hMom     = iMomentum(_Symbol, PERIOD_M15, MomPeriod, PRICE_CLOSE);
+   hATR     = iATR(_Symbol, PERIOD_M15, ATRPeriod);
+   hATR_M3  = iATR(_Symbol, PERIOD_M3, ATRPeriod);
+
+   trade.SetExpertMagicNumber(123456);
+   initialEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   equityTarget = initialEquity * 2;
+   equityStopLoss = initialEquity * 0.8; 
+   
+   Print("KIT-ARA Bot Initialized.");
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason) {
+   ObjectsDeleteAll(0, "HUD_");
+}
+
+void OnTick() {
+   if(IsNFPPauseActive() || IsFridayExit()) { 
+      BotActive = false; 
+      tradeReason = IsFridayExit() ? "FRIDAY EXIT" : "NFP PAUSE";
+      return; 
+   }
+
+   // Fetch Values
+   double f0 = GetVal(hFast);
+   double s0 = GetVal(hSlow);
+   double i0 = GetVal(hIntra);
+   double t0 = GetVal(hTrend);
+   double d1 = GetVal(hD1);
+   double adx0 = GetVal(hADX);
+   double mom0 = GetVal(hMom);
+   double atrVal = GetVal(hATR);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   bool isBullTrend = (i0 > t0 && bid > d1);
+   bool isBearTrend = (i0 < t0 && bid < d1);
+
+   // Pullback Logic
+   if(isBullTrend && !pullbackActive && bid < f0) {
+      pullbackActive = true; lastPullbackType = "BULLISH";
+   } else if(pullbackActive && lastPullbackType == "BULLISH" && bid > f0) {
+      pullbackActive = false;
+      if(GetActiveCount() < MaxTrades) Execute(ORDER_TYPE_BUY, atrVal, 1.0);
+   }
+
+   if(isBearTrend && !pullbackActive && ask > f0) {
+      pullbackActive = true; lastPullbackType = "BEARISH";
+   } else if(pullbackActive && lastPullbackType == "BEARISH" && ask < f0) {
+      pullbackActive = false;
+      if(GetActiveCount() < MaxTrades) Execute(ORDER_TYPE_SELL, atrVal, 1.0);
+   }
+
+   if(EnableTrendRide) ManageTrendRide(TrendRideATR, TrendRideEMA);
+   
+   DrawTerminalHUD(adx0, mom0, atrVal, 0, "N/A", i0);
+}
+
+//+------------------------------------------------------------------+
+//| Core Functions                                                   |
+//+------------------------------------------------------------------+
+bool Execute(ENUM_ORDER_TYPE type, double atr, double mult) {
+    double lot = (ManualLotSize > 0) ? ManualLotSize : 0.01;
+    double sl = (type == ORDER_TYPE_BUY) ? 
+                SymbolInfoDouble(_Symbol, SYMBOL_BID) - (atr * ATR_SL_Mult) : 
+                SymbolInfoDouble(_Symbol, SYMBOL_ASK) + (atr * ATR_SL_Mult);
+
+    if(type == ORDER_TYPE_BUY) return trade.Buy(lot, _Symbol, 0, sl, 0);
+    if(type == ORDER_TYPE_SELL) return trade.Sell(lot, _Symbol, 0, sl, 0);
+    return false;
+}
+
+int GetActiveCount() {
+   int count = 0;
+   for(int i=PositionsTotal()-1; i>=0; i--) {
+      if(posInfo.SelectByIndex(i) && posInfo.Symbol() == _Symbol && posInfo.Magic() == 123456) count++;
+   }
+   return count;
+}
+
+void ManageTrendRide(double atrMultiplier, int emaPeriod) {
+    double atr = GetVal(hATR);
+    double ema = GetVal(hIntra); // Using IntraEMA as proxy for ride
+
+    for(int i=PositionsTotal()-1; i>=0; i--) {
+        if(posInfo.SelectByIndex(i) && posInfo.Magic() == 123456) {
+            double currentSL = posInfo.StopLoss();
+            double newSL = (posInfo.PositionType() == POSITION_TYPE_BUY) ? 
+                            ema - (atr * atrMultiplier) : ema + (atr * atrMultiplier);
+
+            if(posInfo.PositionType() == POSITION_TYPE_BUY && newSL > currentSL)
+                trade.PositionModify(posInfo.Ticket(), newSL, 0);
+            if(posInfo.PositionType() == POSITION_TYPE_SELL && (newSL < currentSL || currentSL == 0))
+                trade.PositionModify(posInfo.Ticket(), newSL, 0);
+        }
+    }
+}
+
+bool IsFridayExit() {
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   return (dt.day_of_week == 5 && dt.hour >= ExitHourFriday);
+}
+
+bool IsNFPPauseActive() {
+   // Simplified logic: Check if it's the first Friday of the month
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   return (dt.day_of_week == 5 && dt.day <= 7 && dt.hour >= 12 && dt.hour <= 16);
+}
+
+void DrawTerminalHUD(double adx, double mom, double atr, double forecast, string dir, double ema) {
+   string hudText = StringFormat("ADX: %.2f | MOM: %.2f | ATR: %.5f | STATE: %s", adx, mom, atr, tradeReason);
+   Comment(hudText); // Simple HUD for compatibility
+}
+
+void Notify(string msg) {
+   if(InpNotifications) {
+      Print(msg);
+      SendNotification(msg);
+   }
+}
